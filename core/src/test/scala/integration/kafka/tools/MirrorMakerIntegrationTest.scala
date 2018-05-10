@@ -44,9 +44,8 @@ class MirrorMakerIntegrationTest extends KafkaServerTestHarness {
     producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer])
     producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer])
     val producer = new MirrorMakerProducer(true, producerProps)
-    MirrorMaker.producer = producer
-    MirrorMaker.producer.send(new ProducerRecord(topic, msg.getBytes()))
-    MirrorMaker.producer.close()
+    producer.send(new ProducerRecord(topic, msg.getBytes()))
+    producer.close()
 
     val consumerProps = new Properties
     consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, "test-group")
@@ -54,7 +53,7 @@ class MirrorMakerIntegrationTest extends KafkaServerTestHarness {
     consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerList)
     val consumer = new KafkaConsumer(consumerProps, new ByteArrayDeserializer, new ByteArrayDeserializer)
 
-    val mirrorMakerConsumer = new MirrorMakerNewConsumer(consumer, None, whitelistOpt = Some("another_topic,new.*,foo"))
+    val mirrorMakerConsumer = new MirrorMakerNewConsumer(consumer, None, whitelistOpt = Some("another_topic,new.*,foo"), new MirrorMakerProducer(true, producerProps))
     mirrorMakerConsumer.init()
     try {
       TestUtils.waitUntilTrue(() => {

@@ -65,7 +65,7 @@ import org.apache.kafka.common.record.RecordBatch
  */
 object MirrorMaker extends Logging with KafkaMetricsGroup {
 
-  private[tools] var producer: MirrorMakerProducer = null
+  //private[tools] var producer: MirrorMakerProducer = null
   private var mirrorMakerThreads: Seq[MirrorMakerThread] = null
   private val isShuttingdown: AtomicBoolean = new AtomicBoolean(false)
   // Track the messages not successfully sent by mirror maker.
@@ -236,7 +236,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       // Always set producer key and value serializer to ByteArraySerializer.
       producerProps.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
       producerProps.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
-      producer = new MirrorMakerProducer(sync, producerProps)
+      //producer = new MirrorMakerProducer(sync, producerProps)
 
       // Create consumers
       val mirrorMakerConsumers = if (useOldConsumer) {
@@ -276,6 +276,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         createNewConsumers(
           numStreams,
           consumerProps,
+          producerProps, sync,
           customRebalanceListener,
           Option(options.valueOf(whitelistOpt)))
       }
@@ -342,6 +343,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
 
   def createNewConsumers(numStreams: Int,
                          consumerConfigProps: Properties,
+                         producerConfigProps: Properties, sync: Boolean,
                          customRebalanceListener: Option[org.apache.kafka.clients.consumer.ConsumerRebalanceListener],
                          whitelist: Option[String]) : Seq[MirrorMakerBaseConsumer] = {
     // Disable consumer auto offsets commit to prevent data loss.
@@ -356,7 +358,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       new KafkaConsumer[Array[Byte], Array[Byte]](consumerConfigProps)
     }
     whitelist.getOrElse(throw new IllegalArgumentException("White list cannot be empty for new consumer"))
-    consumers.map(consumer => new MirrorMakerNewConsumer(consumer, customRebalanceListener, whitelist))
+    consumers.map(consumer => new MirrorMakerNewConsumer(consumer, customRebalanceListener, whitelist, new MirrorMakerProducer(sync, producerConfigProps)))
   }
 
   def commitOffsets(mirrorMakerConsumer: MirrorMakerBaseConsumer) {
@@ -391,9 +393,10 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       if (mirrorMakerThreads != null) {
         mirrorMakerThreads.foreach(_.shutdown())
         mirrorMakerThreads.foreach(_.awaitShutdown())
+        mirrorMakerThreads.foreach(_.producer.close())
       }
       info("Closing producer.")
-      producer.close()
+      //producer.close()
       info("Kafka mirror maker shutdown successfully")
     }
   }
@@ -413,6 +416,8 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     @volatile private var shuttingDown: Boolean = false
     this.logIdent = "[%s] ".format(threadName)
 
+    val producer = mirrorMakerConsumer.asInstanceOf[MirrorMakerNewConsumer].dedicatedProducer
+
     setName(threadName)
 
     override def run() {
@@ -429,7 +434,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
               trace("Sending message with value size %d and offset %d".format(data.value.length, data.offset))
               val records = messageHandler.handle(data)
               records.asScala.foreach(producer.send)
-              maybeFlushAndCommitOffsets()
+              maybeFlushAndCommitOffsets(producer)
             }
           } catch {
             case _: ConsumerTimeoutException =>
@@ -437,7 +442,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
             case _: WakeupException =>
               trace("Caught ConsumerWakeupException, continue iteration.")
           }
-          maybeFlushAndCommitOffsets()
+          maybeFlushAndCommitOffsets(producer)
         }
       } catch {
         case t: Throwable =>
@@ -466,7 +471,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       }
     }
 
-    def maybeFlushAndCommitOffsets() {
+    def maybeFlushAndCommitOffsets(producer: MirrorMakerProducer) {
       val commitRequested = mirrorMakerConsumer.commitRequested()
       if (commitRequested || System.currentTimeMillis() - lastOffsetCommitMs > offsetCommitIntervalMs) {
         debug("Committing MirrorMaker state.")
@@ -502,6 +507,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
   }
 
   private[kafka] trait MirrorMakerBaseConsumer extends BaseConsumer {
+    def dedicatedProducer(): MirrorMakerProducer
     def init()
     def commitRequested(): Boolean
     def notifyCommit()
@@ -584,12 +590,14 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     override def commit() {
       connector.commitOffsets
     }
+
+    override def dedicatedProducer(): MirrorMakerProducer = throw new UnsupportedOperationException("MirrorMakerOldConsumer does not have a companion producer...")
   }
 
   // Only for testing
   private[tools] class MirrorMakerNewConsumer(consumer: Consumer[Array[Byte], Array[Byte]],
                                        customRebalanceListener: Option[org.apache.kafka.clients.consumer.ConsumerRebalanceListener],
-                                       whitelistOpt: Option[String])
+                                       whitelistOpt: Option[String], newProducer: MirrorMakerProducer)
     extends MirrorMakerBaseConsumer {
     val regex = whitelistOpt.getOrElse(throw new IllegalArgumentException("New consumer only supports whitelist."))
     var recordIter: java.util.Iterator[ConsumerRecord[Array[Byte], Array[Byte]]] = null
@@ -601,7 +609,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
 
     override def init() {
       debug("Initiating new consumer")
-      val consumerRebalanceListener = new InternalRebalanceListenerForNewConsumer(this, customRebalanceListener)
+      val consumerRebalanceListener = new InternalRebalanceListenerForNewConsumer(this, customRebalanceListener, dedicatedProducer)
       whitelistOpt.foreach { whitelist =>
         try {
           consumer.subscribe(Pattern.compile(Whitelist(whitelist).regex), consumerRebalanceListener)
@@ -620,7 +628,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     override def notifyCommit() {
       // Do nothing
     }
-    
+
     override def commitRequested(): Boolean = {
       false
     }
@@ -666,10 +674,13 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       consumer.commitSync(offsets.map { case (tp, offset) =>  (tp, new OffsetAndMetadata(offset, ""))}.asJava)
       offsets.clear()
     }
+
+    override def dedicatedProducer(): MirrorMakerProducer = newProducer
   }
 
   private class InternalRebalanceListenerForNewConsumer(mirrorMakerConsumer: MirrorMakerBaseConsumer,
-                                                        customRebalanceListenerForNewConsumer: Option[org.apache.kafka.clients.consumer.ConsumerRebalanceListener])
+                                                        customRebalanceListenerForNewConsumer: Option[org.apache.kafka.clients.consumer.ConsumerRebalanceListener],
+                                                        producer: MirrorMakerProducer)
     extends org.apache.kafka.clients.consumer.ConsumerRebalanceListener {
 
     override def onPartitionsRevoked(partitions: util.Collection[TopicPartition]) {
@@ -709,7 +720,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         this.producer.send(record).get()
       } else {
           this.producer.send(record,
-            new MirrorMakerProducerCallback(record.topic(), record.key(), record.value()))
+            new MirrorMakerProducerCallback(record.topic(), record.key(), record.value(), this))
       }
     }
 
@@ -726,7 +737,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     }
   }
 
-  private class MirrorMakerProducerCallback (topic: String, key: Array[Byte], value: Array[Byte])
+  private class MirrorMakerProducerCallback (topic: String, key: Array[Byte], value: Array[Byte], producer: MirrorMakerProducer)
     extends ErrorLoggingCallback(topic, key, value, false) {
 
     override def onCompletion(metadata: RecordMetadata, exception: Exception) {
